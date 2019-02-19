@@ -4,9 +4,18 @@ import os
 import subprocess
 import datetime
 from glob import glob
-
+import scipy.signal
+import numpy as np
+from mtpy.uofa.qel_monitoring_j2edi import convert2edi
+# from simpleplotCOH import plotcoh
+from mtpy.uofa.simpleplotEDI import plotedi
 
 base_dir = '/g/data/my80/States_and_Territories/SA/Broadband/Renmark_2009/TS'
+birrp_location = '/g/data/my80/proc/birrp_comp/birrp'
+survey_cfg_fn = '/g/data/my80/proc/test_birrp/stations.cfg'
+mtpy_location = '~/mtpy'
+instr_resp_fn = ('/home/566/dc3755/mtpy/mtpy/uofa/lemi_coils_instrument' +
+                 '_response_freq_real_imag.txt')
 tmp_dir = '/tmp'
 channels = ['BX', 'BY', 'EX', 'EY']
 frequency = 500
@@ -105,32 +114,55 @@ def write_birrp_inputs(local_site, remote_site, out_dir):
         files = sorted([i for i in remote_site['files'] if channel in i])
         write_files(files, remote_skip, num_samples, channel, out_dir,
                     remote=True)
-          
+    
+    return num_samples
 
-def gen_birrp_script(out_dir):
-    birrp_string =  '\n'.join(['1', '2', '2', '2', '0', '2', '-500',
-                               '65536,2,12', '3,1,3', 'y', '2',
-                               '0,0.0001,0.9999', '0', 'output', '0', '3',
-                               '-46.875,-93.750,-156.25', '1', '15', '0', '0',
-                               '1000000', '0', '{0}remote.BY', '0', '0',
-                               '{0}remote.BX', '0', '0', '{0}local.BY', '0',
-                               '0', '{0}local.BX', '0', '0', '{0}local.EY',
-                               '0', '0', '{0}local.EX', '0', '0,90,0',
-                               '0,90,0', '0,90,0'])
-    birrp_string = birrp_string.format(os.path.join(out_dir, ''))
+
+def gen_birrp_script(out_dir, samples, sample_rate):  
+    birrp_string = '\n'.join(['1', '2', '2', '2', '1', '3', '{2}',
+                              '32768,2,10', '5,3,3', 'y', '2',  
+                              '0,0.0001,0.9999', '0.0', '0.0', 'output{2}', '0', '0',                              
+                              '1', '15', '0', '0', '{1}', '0', '{0}local.EY', '0',
+                              '0', '{0}local.EX', '0', '0', '{0}local.BY', '0',
+                              '0', '{0}local.BX', '0', '0', '{0}remote.BY',  
+                              '0', '0', '{0}remote.BX', '0', '0,90,0',
+                              '0,90,0', '0,90,0'])
+    birrp_string = birrp_string.format(os.path.join(out_dir, ''),
+                                       min(samples, 2e8), sample_rate)
     return birrp_string
 
 
-def run_birrp(out_dir, birrp_script):
-    os.chdir(out_dir)
-    p = subprocess.Popen(['birrp-5.3.2'], stdin=subprocess.PIPE,
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         encoding='utf8')
-    o, e = p.communicate(birrp_script)
+def process_birrp_results(out_dir):
+    convert2edi('output', out_dir , survey_cfg_fn, instr_resp_fn, None)
+    edi = glob(os.path.join(out_dir, '*.edi'))
+    plotedi(edi)
+    return
 
 
-def plot_birrp_results(out_dir):
-    pass
+def run_birrp(out_dir, birrp_script, birrp_location, mtpy_location,
+              survey_cfg_fn):
+    j2edi_location = os.path.join(mtpy_location, 'mtpy', 'uofa',
+                                  'qel_monitoring_j2edi.py')
+    plotedi_location = os.path.join(mtpy_location, 'mtpy', 'uofa',
+                                    'simpleplotEDI.py')
+    instr_resp_fn = os.path.join(mtpy_location, 'mtpy', 'uofa', ('lemi_coils' +
+                                 '_instrument_response_freq_real_imag.txt'))
+    script_fn = os.path.join(out_dir, 'script.txt')
+    edi_fn = os.path.join(out_dir, 'qel_OUTPUT_000000.edi')
+    with open(script_fn, 'w') as f:
+        f.write(birrp_script)
+    shell_script = '\n'.join(['#PBS -P nf4', '#PBS -q normal',
+                              ('#PBS -l walltime=0:20:00,mem=32GB,ncpus=1,'+
+                              'jobfs=100MB'),
+                              '#PBS -l wd', '', ' < '.join([birrp_location,
+                                                           script_fn]), 
+                              ' '.join(['python', j2edi_location, 'output', 
+                                       out_dir, survey_cfg_fn, instr_resp_fn]),
+                              ' '.join(['python', plotedi_location, edi_fn])])
+    shell_fn = os.path.join(out_dir, out_dir.split('/')[-1] + '_birrp.sh')
+    with open(shell_fn, 'w') as f:
+        f.write(shell_script)
+    # os.system('qsub {}'.format(shell_fn))
 
 
 def loop_sites():
@@ -140,7 +172,31 @@ def loop_sites():
             dir_name = local_site['name']+remote_site['name']
             out_dir = os.path.join(tmp_dir, dir_name)
             os.makedirs(out_dir)
-            write_birrp_inputs(local_site, remote_site, out_dir)
-            birrp_script = gen_birrp_script(out_dir)
+            samples = write_birrp_inputs(local_site, remote_site, out_dir)
+            birrp_script = gen_birrp_script(out_dir, samples)
             run_birrp(out_dir, birrp_script)
-            plot_birrp_results(out_dir)
+            # process_birrp_results(out_dir)
+
+
+def decimate_file(fn, decimation):
+    directory, base = os.path.split(fn)
+    base = base.split('.')
+    new_fn = base[0] + 'dec' + str(decimation) + '.' + base[1]
+    new_fn = os.path.join(directory, new_fn)
+    f = np.genfromtxt(fn)
+    f = scipy.signal.decimate(f, decimation, ftype='fir', zero_phase=True)
+    np.savetxt(new_fn, f)
+
+
+def run_one_site(local_site, remote_site):
+    dir_name = local_site['name']+remote_site['name']
+    out_dir = os.path.join(tmp_dir, dir_name)
+    os.makedirs(out_dir)
+    samples = write_birrp_inputs(local_site, remote_site, out_dir)
+    birrp_script = gen_birrp_script(out_dir, samples)
+    run_birrp(out_dir, birrp_script)
+
+for i in ['local.BX', 'local.BY', 'local.EX', 'local.EY', 'remote.BX',
+          'remote.BY']:
+    decimate_file(i, 10)
+    decimate_file(i, 100)
